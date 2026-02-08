@@ -10,6 +10,7 @@ OWNER_ID = "609150604"
 URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 last_update_id = 0
 
+# ---------- HELPERS ----------
 def send_message(chat_id, text, keyboard=None):
     data = {"chat_id": chat_id, "text": text}
     if keyboard:
@@ -24,43 +25,25 @@ def send_video(chat_id, file_path):
             files={"video": video}
         )
 
-def notify_owner(user):
-    name = user.get("first_name", "")
-    username = user.get("username", "N/A")
-    user_id = user["id"]
+def main_menu():
+    return {
+        "inline_keyboard": [
+            [{"text": "📸 Instagram", "callback_data": "INSTAGRAM"}],
+            [{"text": "▶️ YouTube", "callback_data": "YOUTUBE"}],
+            [{"text": "💸 Cashflow", "callback_data": "CASHFLOW"}],
+        ]
+    }
 
+def notify_owner(user):
     text = (
         "👤 New user using the bot\n\n"
-        f"Name: {name}\n"
-        f"Username: @{username}\n"
-        f"User ID: {user_id}"
+        f"Name: {user.get('first_name','')}\n"
+        f"Username: @{user.get('username','N/A')}\n"
+        f"User ID: {user['id']}"
     )
     send_message(OWNER_ID, text)
 
-def get_youtube_qualities(url):
-    result = subprocess.run(
-        ["yt-dlp", "-J", url],
-        capture_output=True,
-        text=True
-    )
-
-    data = json.loads(result.stdout)
-    formats = data.get("formats", [])
-
-    qualities = {}
-    for f in formats:
-        if f.get("vcodec") != "none":
-            height = f.get("height")
-            fps = f.get("fps", 30)
-            if height:
-                key = f"{height}p{fps if fps > 30 else ''}"
-                qualities[key] = height, fps
-
-    return sorted(
-        qualities.items(),
-        key=lambda x: (x[1][0], x[1][1])
-    )
-
+# ---------- MAIN LOOP ----------
 while True:
     res = requests.get(f"{URL}/getUpdates?offset={last_update_id + 1}").json()
 
@@ -68,36 +51,22 @@ while True:
         for update in res["result"]:
             last_update_id = update["update_id"]
 
-            # ---------- CALLBACK ----------
+            # ===== INLINE BUTTON CLICK =====
             if "callback_query" in update:
                 cb = update["callback_query"]
                 chat_id = cb["message"]["chat"]["id"]
                 action = cb["data"]
 
-                if action.startswith("YT|"):
-                    _, height, fps, url = action.split("|")
-                    send_message(chat_id, f"⬇️ Downloading {height}p {fps}fps video...")
+                if action == "INSTAGRAM":
+                    send_message(chat_id, "📸 Instagram video / reel link anuppu")
+                elif action == "YOUTUBE":
+                    send_message(chat_id, "▶️ YouTube video link anuppu")
+                elif action == "CASHFLOW":
+                    send_message(chat_id, "💸 Cashflow – coming soon 😄")
 
-                    output = f"yt_{chat_id}.mp4"
-                    try:
-                        subprocess.run(
-                            [
-                                "yt-dlp",
-                                "-f",
-                                f"bestvideo[height<={height}][fps<={fps}]+bestaudio/best",
-                                "-o",
-                                output,
-                                url
-                            ],
-                            check=True
-                        )
-                        send_video(chat_id, output)
-                        os.remove(output)
-                    except:
-                        send_message(chat_id, "❌ YouTube download failed")
                 continue
 
-            # ---------- MESSAGE ----------
+            # ===== NORMAL MESSAGE =====
             if "message" not in update:
                 continue
 
@@ -110,14 +79,14 @@ while True:
 
             text = msg["text"].strip()
 
-            # START
+            # ----- START -----
             if text == "/start":
-                notify_owner(user)
-                username = user.get("username", "")
-                send_message(chat_id, f"👋 Hi @{username}")
+                notify_owner(user)  # 👈 OWNER ONLY
+                send_message(chat_id, f"👋 Hi {user.get('first_name','user')}")
+                send_message(chat_id, "👇 Choose an option", main_menu())
                 continue
 
-            # INSTAGRAM
+            # ----- INSTAGRAM -----
             if "instagram.com" in text:
                 send_message(chat_id, "⬇️ Downloading Instagram video...")
                 output = f"ig_{chat_id}.mp4"
@@ -129,21 +98,11 @@ while True:
                     send_message(chat_id, "❌ Instagram download failed")
                 continue
 
-            # YOUTUBE
+            # ----- YOUTUBE -----
             if "youtube.com" in text or "youtu.be" in text:
-                qualities = get_youtube_qualities(text)
-
-                buttons = []
-                for label, (h, fps) in qualities:
-                    buttons.append(
-                        [{"text": label, "callback_data": f"YT|{h}|{fps}|{text}"}]
-                    )
-
-                send_message(
-                    chat_id,
-                    "🎥 Available video qualities",
-                    {"inline_keyboard": buttons}
-                )
+                send_message(chat_id, "🎥 YouTube download feature active (quality select next step)")
                 continue
+
+            send_message(chat_id, "❌ Please use /start and choose an option")
 
     time.sleep(2)
