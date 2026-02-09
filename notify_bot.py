@@ -1,61 +1,67 @@
 import requests
 import time
 import os
-import subprocess
 import json
+import subprocess
 from datetime import datetime
+
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-BOT_TOKEN = "8272387883:AAEFAt7lMX0EjX6BvL9tVVETNXUkfhzASXE"
-OWNER_ID = "609150604"
-SHEET_ID = "1brwMcSQCSH5Ehl7PUQ8ys64BdR0bLfL5tD2tRGmpyU8"
+# ================= CONFIG =================
+BOT_TOKEN = os.environ.get("BOT_TOKEN")      # Telegram bot token
+OWNER_ID = os.environ.get("OWNER_ID")        # Your Telegram user ID
+SPREADSHEET_ID = os.environ.get("SHEET_ID")  # Google Sheet ID
 
-URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 last_update_id = 0
 
-# ---------- GOOGLE SHEET ----------
+# ================= GOOGLE SHEETS AUTH =================
 scope = [
     "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive"
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
 ]
-creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
-gs_client = gspread.authorize(creds)
-sheet = gs_client.open_by_key(SHEET_ID).worksheet("telegram")
 
-def log_to_sheet(user, action, content):
-    sheet.append_row([
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        user.get("first_name",""),
-        user.get("username",""),
-        user["id"],
-        action,
-        content
-    ])
+creds_json = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
+gc = gspread.authorize(creds)
 
-# ---------- TELEGRAM HELPERS ----------
+sheet = gc.open_by_key(SPREADSHEET_ID)
+
+# get or create "telegram" sheet
+try:
+    ws = sheet.worksheet("telegram")
+except gspread.WorksheetNotFound:
+    ws = sheet.add_worksheet(title="telegram", rows="1000", cols="10")
+    ws.append_row(
+        ["Time", "Name", "Username", "UserID", "Action", "Content"]
+    )
+
+# ================= HELPERS =================
 def send_message(chat_id, text, keyboard=None):
     data = {"chat_id": chat_id, "text": text}
     if keyboard:
         data["reply_markup"] = json.dumps(keyboard)
-    requests.post(f"{URL}/sendMessage", data=data)
+    requests.post(f"{TELEGRAM_API}/sendMessage", data=data)
 
 def send_video(chat_id, file_path):
-    with open(file_path, "rb") as video:
+    with open(file_path, "rb") as f:
         requests.post(
-            f"{URL}/sendVideo",
+            f"{TELEGRAM_API}/sendVideo",
             data={"chat_id": chat_id},
-            files={"video": video}
+            files={"video": f}
         )
 
-def main_menu():
-    return {
-        "inline_keyboard": [
-            [{"text": "📸 Instagram", "callback_data": "INSTAGRAM"}],
-            [{"text": "▶️ YouTube", "callback_data": "YOUTUBE"}],
-            [{"text": "💸 Cashflow", "callback_data": "CASHFLOW"}],
-        ]
-    }
+def log_to_sheet(user, action, content):
+    ws.append_row([
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        user.get("first_name", ""),
+        user.get("username", ""),
+        user.get("id", ""),
+        action,
+        content
+    ])
 
 def notify_owner(user):
     text = (
@@ -66,70 +72,50 @@ def notify_owner(user):
     )
     send_message(OWNER_ID, text)
 
-# ---------- YOUTUBE ----------
-def get_youtube_qualities(url):
-    result = subprocess.run(["yt-dlp", "-J", url], capture_output=True, text=True)
-    data = json.loads(result.stdout)
-    formats = data.get("formats", [])
+def main_menu():
+    return {
+        "inline_keyboard": [
+            [{"text": "📸 Instagram", "callback_data": "INSTAGRAM"}],
+            [{"text": "▶️ YouTube", "callback_data": "YOUTUBE"}],
+            [{"text": "💸 Cashflow", "callback_data": "CASHFLOW"}],
+        ]
+    }
 
-    seen = {}
-    for f in formats:
-        if f.get("vcodec") != "none" and f.get("height"):
-            h = f["height"]
-            fps = int(f.get("fps", 30))
-            label = f"{h}p{fps if fps > 30 else ''}"
-            seen[label] = (h, fps)
+# ================= MAIN LOOP =================
+print("🤖 Bot started...")
 
-    return sorted(seen.items(), key=lambda x: (x[1][0], x[1][1]))
-
-# ---------- MAIN LOOP ----------
 while True:
-    res = requests.get(f"{URL}/getUpdates?offset={last_update_id + 1}").json()
+    try:
+        res = requests.get(
+            f"{TELEGRAM_API}/getUpdates",
+            params={"offset": last_update_id + 1, "timeout": 30}
+        ).json()
 
-    if res.get("ok"):
+        if not res.get("ok"):
+            time.sleep(2)
+            continue
+
         for update in res["result"]:
             last_update_id = update["update_id"]
 
-            # ===== CALLBACK =====
+            # ---------- CALLBACK ----------
             if "callback_query" in update:
                 cb = update["callback_query"]
                 chat_id = cb["message"]["chat"]["id"]
                 action = cb["data"]
 
                 if action == "INSTAGRAM":
-                    send_message(chat_id, "📸 Instagram link anuppu")
+                    send_message(chat_id, "📸 Instagram reel / video link anuppu")
 
                 elif action == "YOUTUBE":
                     send_message(chat_id, "▶️ YouTube video link anuppu")
 
                 elif action == "CASHFLOW":
-                    send_message(chat_id, "💸 Cashflow – coming soon")
-
-                elif action.startswith("YT|"):
-                    _, h, fps, url = action.split("|")
-                    send_message(chat_id, f"⬇️ Downloading {h}p {fps}fps...")
-
-                    output = f"yt_{chat_id}.mp4"
-                    try:
-                        subprocess.run(
-                            [
-                                "yt-dlp",
-                                "-f",
-                                f"bestvideo[height<={h}][fps<={fps}][filesize_approx<1500M]+bestaudio/best",
-                                "-o",
-                                output,
-                                url
-                            ],
-                            check=True
-                        )
-                        send_video(chat_id, output)
-                        os.remove(output)
-                    except:
-                        send_message(chat_id, "❌ YouTube download failed")
+                    send_message(chat_id, "💸 Cashflow – coming soon 😄")
 
                 continue
 
-            # ===== MESSAGE =====
+            # ---------- MESSAGE ----------
             if "message" not in update:
                 continue
 
@@ -137,57 +123,60 @@ while True:
             chat_id = msg["chat"]["id"]
             user = msg["from"]
 
-            # FILE / FORWARD
-            if "document" in msg or "video" in msg or "audio" in msg:
-                file_obj = msg.get("document") or msg.get("video") or msg.get("audio")
-                file_id = file_obj["file_id"]
-                file_name = file_obj.get("file_name", "file")
-
-                r = requests.get(f"{URL}/getFile", params={"file_id": file_id}).json()
-                file_path = r["result"]["file_path"]
-                download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-
-                send_message(chat_id, f"⬇️ Download link:\n{download_url}")
-                log_to_sheet(user, "FILE", file_name)
-                continue
-
             if "text" not in msg:
                 continue
 
             text = msg["text"].strip()
 
-            # START
+            # /start
             if text == "/start":
                 notify_owner(user)
+                log_to_sheet(user, "START", "")
                 send_message(chat_id, f"👋 Hi @{user.get('username','user')}")
                 send_message(chat_id, "👇 Choose an option", main_menu())
-                log_to_sheet(user, "START", "")
                 continue
 
-            # INSTAGRAM
+            # Instagram
             if "instagram.com" in text:
                 send_message(chat_id, "⬇️ Downloading Instagram video...")
+                log_to_sheet(user, "INSTAGRAM", text)
+
                 output = f"ig_{chat_id}.mp4"
                 try:
-                    subprocess.run(["yt-dlp", "-o", output, text], check=True)
+                    subprocess.run(
+                        ["yt-dlp", "-f", "mp4", "-o", output, text],
+                        check=True
+                    )
                     send_video(chat_id, output)
                     os.remove(output)
-                    log_to_sheet(user, "INSTAGRAM", text)
-                except:
+                except Exception as e:
                     send_message(chat_id, "❌ Instagram download failed")
+
                 continue
 
-            # YOUTUBE
+            # YouTube
             if "youtube.com" in text or "youtu.be" in text:
-                qualities = get_youtube_qualities(text)
-                buttons = [
-                    [{"text": label, "callback_data": f"YT|{h}|{fps}|{text}"}]
-                    for label, (h, fps) in qualities
-                ]
-                send_message(chat_id, "🎥 Available qualities", {"inline_keyboard": buttons})
+                send_message(chat_id, "⬇️ Downloading YouTube video (best quality)...")
                 log_to_sheet(user, "YOUTUBE", text)
+
+                output = f"yt_{chat_id}.mp4"
+                try:
+                    subprocess.run(
+                        ["yt-dlp", "-f", "bestvideo+bestaudio/best", "-o", output, text],
+                        check=True
+                    )
+                    send_video(chat_id, output)
+                    os.remove(output)
+                except Exception as e:
+                    send_message(chat_id, "❌ YouTube download failed")
+
                 continue
 
-            send_message(chat_id, "❌ Use /start and choose an option")
+            # default
+            send_message(chat_id, "❌ Please use /start")
 
-    time.sleep(2)
+        time.sleep(1)
+
+    except Exception as e:
+        print("ERROR:", e)
+        time.sleep(5)
