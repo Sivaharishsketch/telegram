@@ -114,9 +114,18 @@ while True:
                 f"{TG_API}/getFile",
                 params={"file_id": file_id}
             ).json()
-
+            
+            if not file_info.get("ok"):
+                send_message(chat_id, "❌ Unable to generate download link for this file")
+                log(user, "FILE_FAILED", str(file_info))
+                continue
+            
             file_path = file_info["result"]["file_path"]
             download_link = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+            
+            send_message(chat_id, f"⬇️ Direct download link:\n{download_link}")
+            log(user, "FILE", download_link)
+
 
             send_message(chat_id, f"⬇️ Direct download link:\n{download_link}")
             log(user, "FILE", download_link)
