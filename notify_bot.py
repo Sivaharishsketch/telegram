@@ -1,192 +1,107 @@
-import requests
-import time
 import os
-import json
 import subprocess
-from datetime import datetime
+import requests
+from telegram import Update
+from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-
-# ================= CONFIG =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID"))
-SHEET_ID = os.getenv("SHEET_ID")
-GOOGLE_CREDS_RAW = os.getenv("GOOGLE_CREDENTIALS")
 
-TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-last_update_id = 0
+DOWNLOAD_DIR = "downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# ================= GOOGLE SHEETS =================
-scope = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
+# ---------- COMMON SEND ----------
+async def send_file(update, file_path, caption="✅ Downloaded"):
+    size_mb = os.path.getsize(file_path) / (1024 * 1024)
 
-creds = ServiceAccountCredentials.from_json_keyfile_dict(
-    json.loads(GOOGLE_CREDS_RAW), scope
-)
-gc = gspread.authorize(creds)
-sheet = gc.open_by_key(SHEET_ID)
+    if size_mb > 49:
+        await update.message.reply_text("❌ File too large for Telegram")
+        return
 
-try:
-    ws = sheet.worksheet("telegram")
-except:
-    ws = sheet.add_worksheet("telegram", 1000, 10)
-    ws.append_row(["Time", "Name", "Username", "UserID", "Action", "Content"])
+    with open(file_path, "rb") as f:
+        await update.message.reply_document(f, caption=caption)
 
-# ================= HELPERS =================
-def send_message(chat_id, text):
-    return requests.post(
-        f"{TG_API}/sendMessage",
-        data={"chat_id": chat_id, "text": text}
-    ).json()
+    os.remove(file_path)
 
-def edit_message(chat_id, message_id, text):
-    requests.post(
-        f"{TG_API}/editMessageText",
-        data={
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text": text
-        }
-    )
 
-def send_document(chat_id, path):
-    with open(path, "rb") as f:
-        requests.post(
-            f"{TG_API}/sendDocument",
-            data={"chat_id": chat_id},
-            files={"document": f},
-        )
+# ---------- YOUTUBE ----------
+async def youtube_download(update, url):
+    await update.message.reply_text("⬇️ YouTube downloading...")
 
-def log(user, action, content):
-    ws.append_row([
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        user.get("first_name", ""),
-        user.get("username", ""),
-        user.get("id", ""),
-        action,
-        content
-    ])
+    output = f"{DOWNLOAD_DIR}/%(title).50s.%(ext)s"
+    cmd = [
+        "yt-dlp",
+        "-f", "bv*[height<=720]+ba/b",
+        "--merge-output-format", "mp4",
+        "--no-playlist",
+        "-o", output,
+        url
+    ]
 
-def notify_owner(user):
-    send_message(
-        OWNER_ID,
-        f"👤 New user\n\n"
-        f"Name: {user.get('first_name')}\n"
-        f"Username: @{user.get('username','N/A')}\n"
-        f"User ID: {user['id']}"
-    )
+    subprocess.run(cmd, check=True)
+    file = sorted(os.listdir(DOWNLOAD_DIR))[-1]
+    await send_file(update, f"{DOWNLOAD_DIR}/{file}", "🎬 YouTube Downloaded")
 
-# ================= BOT LOOP =================
-print("🤖 Bot started")
 
-while True:
-    updates = requests.get(
-        f"{TG_API}/getUpdates",
-        params={"offset": last_update_id + 1, "timeout": 30}
-    ).json()
+# ---------- INSTAGRAM ----------
+async def instagram_download(update, url):
+    await update.message.reply_text("⬇️ Instagram downloading...")
 
-    if not updates.get("ok"):
-        time.sleep(2)
-        continue
+    output = f"{DOWNLOAD_DIR}/%(title).50s.%(ext)s"
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "-o", output,
+        url
+    ]
 
-    for upd in updates["result"]:
-        last_update_id = upd["update_id"]
+    subprocess.run(cmd, check=True)
+    file = sorted(os.listdir(DOWNLOAD_DIR))[-1]
+    await send_file(update, f"{DOWNLOAD_DIR}/{file}", "📸 Instagram Downloaded")
 
-        if "message" not in upd:
-            continue
 
-        msg = upd["message"]
-        chat_id = msg["chat"]["id"]
-        user = msg["from"]
-        text = msg.get("text", "")
+# ---------- DIRECT LINK ----------
+async def direct_download(update, url):
+    await update.message.reply_text("⬇️ Downloading file...")
 
-        # ===== START =====
-        if text == "/start":
-            notify_owner(user)
-            log(user, "START", "")
-            send_message(chat_id, "👋 Hi! Send YouTube / Instagram link or forward a file")
-            continue
+    filename = url.split("/")[-1].split("?")[0]
+    file_path = f"{DOWNLOAD_DIR}/{filename}"
 
-        # ===== FILE (ANY SIZE) =====
-        if "document" in msg or "video" in msg:
-            file = msg.get("document") or msg.get("video")
-            file_id = file["file_id"]
+    r = requests.get(url, stream=True, timeout=60)
+    r.raise_for_status()
 
-            r = requests.get(
-                f"{TG_API}/getFile",
-                params={"file_id": file_id}
-            ).json()
+    with open(file_path, "wb") as f:
+        for chunk in r.iter_content(1024 * 1024):
+            f.write(chunk)
 
-            if not r.get("ok"):
-                send_message(chat_id, "❌ Unable to generate download link")
-                continue
+    await send_file(update, file_path, "📁 File Downloaded")
 
-            file_path = r["result"]["file_path"]
-            link = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
 
-            send_message(chat_id, f"⬇️ Direct download link:\n{link}")
-            log(user, "FILE", link)
-            continue
+# ---------- MAIN HANDLER ----------
+async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
 
-        # ===== YOUTUBE =====
-        if "youtube.com" in text or "youtu.be" in text:
-            log(user, "YOUTUBE", text)
+    try:
+        if "youtu" in url:
+            await youtube_download(update, url)
 
-            msg_obj = send_message(chat_id, "⏳ Preparing download...")
-            mid = msg_obj["result"]["message_id"]
+        elif "instagram.com" in url:
+            await instagram_download(update, url)
 
-            out = f"yt_{chat_id}.mp4"
-            try:
-                edit_message(chat_id, mid, "⬇️ Downloading video...")
-                subprocess.run(
-                    ["yt-dlp", "-f", "best[ext=mp4]/best", "-o", out, text],
-                    check=True
-                )
+        elif url.startswith("http"):
+            await direct_download(update, url)
 
-                edit_message(chat_id, mid, "📤 Uploading to Telegram...")
+        else:
+            await update.message.reply_text("❌ Unsupported link")
 
-                if os.path.getsize(out) < 45 * 1024 * 1024:
-                    send_document(chat_id, out)
-                else:
-                    send_message(chat_id, "⚠️ File too large, cannot upload via bot.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed\n\n{str(e)}")
 
-                edit_message(chat_id, mid, "✅ Download complete")
-                os.remove(out)
 
-            except:
-                edit_message(chat_id, mid, "❌ YouTube download failed")
-            continue
+# ---------- START ----------
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_links))
+    app.run_polling()
 
-        # ===== INSTAGRAM =====
-        if "instagram.com" in text:
-            log(user, "INSTAGRAM", text)
-
-            msg_obj = send_message(chat_id, "⏳ Preparing Instagram download...")
-            mid = msg_obj["result"]["message_id"]
-
-            out = f"ig_{chat_id}.mp4"
-            try:
-                edit_message(chat_id, mid, "⬇️ Downloading Instagram media...")
-                subprocess.run(["yt-dlp", "-o", out, text], check=True)
-
-                edit_message(chat_id, mid, "📤 Uploading to Telegram...")
-
-                if os.path.getsize(out) < 45 * 1024 * 1024:
-                    send_document(chat_id, out)
-                else:
-                    send_message(chat_id, "⚠️ File too large to upload.")
-
-                edit_message(chat_id, mid, "✅ Download complete")
-                os.remove(out)
-
-            except:
-                edit_message(chat_id, mid, "❌ Instagram download failed")
-            continue
-
-        send_message(chat_id, "❌ Send YouTube / Instagram link or forward a file")
-
-    time.sleep(1)
+if __name__ == "__main__":
+    main()
