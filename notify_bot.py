@@ -152,7 +152,7 @@ while True:
 
                 edit_message(chat_id, msg_id, "📤 Uploading to Telegram...")
 
-                if os.path.getsize(out) <  *1000 1024 * 1024:
+                if os.path.getsize(out) <  1000 * 1024 * 1024:
                     send_document(chat_id, out)
                 else:
                     send_message(chat_id, "⚠️ File >45MB, sending link only")
