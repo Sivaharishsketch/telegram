@@ -20,6 +20,8 @@ if not all([BOT_TOKEN, OWNER_ID, SHEET_ID, GOOGLE_CREDS_RAW]):
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 last_update_id = 0
 
+MAX_UPLOAD_SIZE = 1024 * 1024 * 1024   # 1GB
+
 # ================= GOOGLE SHEETS =================
 scope = [
     "https://spreadsheets.google.com/feeds",
@@ -47,6 +49,7 @@ def send_message(chat_id, text):
     ).json()
     return r["result"]["message_id"] if r.get("ok") else None
 
+
 def edit_message(chat_id, msg_id, text):
     requests.post(
         f"{TG_API}/editMessageText",
@@ -57,6 +60,7 @@ def edit_message(chat_id, msg_id, text):
         }
     )
 
+
 def send_document(chat_id, file_path):
     with open(file_path, "rb") as f:
         requests.post(
@@ -64,6 +68,7 @@ def send_document(chat_id, file_path):
             data={"chat_id": chat_id},
             files={"document": f}
         )
+
 
 def log(user, action, content):
     ws.append_row([
@@ -74,6 +79,7 @@ def log(user, action, content):
         action,
         content
     ])
+
 
 def notify_owner(user):
     send_message(
@@ -112,7 +118,14 @@ while True:
         if text == "/start":
             notify_owner(user)
             log(user, "START", "")
-            send_message(chat_id, "👋 Hi!\nSend YouTube / Instagram link or forward any file")
+            send_message(
+                chat_id,
+                "👋 Hi!\n\n"
+                "• Send YouTube link\n"
+                "• Send Instagram link\n"
+                "• Or forward any file\n\n"
+                "⬆️ Supports uploads up to 1GB"
+            )
             continue
 
         # ===== FILE (ANY SIZE) =====
@@ -140,28 +153,41 @@ while True:
         if "youtube.com" in text or "youtu.be" in text:
             log(user, "YOUTUBE", text)
 
-            msg_id = send_message(chat_id, "⏳ Preparing download...")
+            msg_id = send_message(chat_id, "⏳ Preparing YouTube download...")
             out = f"yt_{chat_id}.mp4"
 
             try:
-                edit_message(chat_id, msg_id, "⬇️ Downloading YouTube video...")
+                edit_message(chat_id, msg_id, "⬇️ Downloading video...")
+
                 subprocess.run(
-                    ["yt-dlp", "-f", "best[ext=mp4]/best", "-o", out, text],
+                    [
+                        "yt-dlp",
+                        "-f", "bv*[filesize<1G]+ba/best",
+                        "-o", out,
+                        text
+                    ],
                     check=True
                 )
 
+                size = os.path.getsize(out)
+
                 edit_message(chat_id, msg_id, "📤 Uploading to Telegram...")
 
-                if os.path.getsize(out) <  1000 * 1024 * 1024:
+                if size <= MAX_UPLOAD_SIZE:
                     send_document(chat_id, out)
                 else:
-                    send_message(chat_id, "⚠️ File >45MB, sending link only")
+                    send_message(
+                        chat_id,
+                        f"⚠️ File size {round(size/1024/1024,2)} MB\n"
+                        "Too large to upload"
+                    )
 
                 edit_message(chat_id, msg_id, "✅ Done")
                 os.remove(out)
 
-            except:
+            except Exception as e:
                 edit_message(chat_id, msg_id, "❌ YouTube download failed")
+                print(e)
             continue
 
         # ===== INSTAGRAM =====
@@ -172,21 +198,32 @@ while True:
             out = f"ig_{chat_id}.mp4"
 
             try:
-                edit_message(chat_id, msg_id, "⬇️ Downloading Instagram media...")
-                subprocess.run(["yt-dlp", "-o", out, text], check=True)
+                edit_message(chat_id, msg_id, "⬇️ Downloading media...")
+
+                subprocess.run(
+                    ["yt-dlp", "-o", out, text],
+                    check=True
+                )
+
+                size = os.path.getsize(out)
 
                 edit_message(chat_id, msg_id, "📤 Uploading to Telegram...")
 
-                if os.path.getsize(out) < 45 * 1024 * 1024:
+                if size <= MAX_UPLOAD_SIZE:
                     send_document(chat_id, out)
                 else:
-                    send_message(chat_id, "⚠️ File too large, cannot upload")
+                    send_message(
+                        chat_id,
+                        f"⚠️ File size {round(size/1024/1024,2)} MB\n"
+                        "Too large to upload"
+                    )
 
                 edit_message(chat_id, msg_id, "✅ Done")
                 os.remove(out)
 
-            except:
+            except Exception as e:
                 edit_message(chat_id, msg_id, "❌ Instagram download failed")
+                print(e)
             continue
 
         send_message(chat_id, "❌ Send YouTube / Instagram link or forward a file")
