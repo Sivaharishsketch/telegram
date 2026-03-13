@@ -22,8 +22,7 @@ last_update_id = 0
 
 MAX_UPLOAD_SIZE = 1024 * 1024 * 1024  # 1GB
 
-# ================= PENDING QUALITY SELECTIONS =================
-# Stores { chat_id: { "url": "...", "type": "youtube" } }
+# Stores pending quality selections: { chat_id: { "url": ..., "platform": ... } }
 pending_quality = {}
 
 # ================= GOOGLE SHEETS =================
@@ -32,7 +31,6 @@ scope = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
-
 creds = ServiceAccountCredentials.from_json_keyfile_dict(
     json.loads(GOOGLE_CREDS_RAW), scope
 )
@@ -46,7 +44,7 @@ except Exception:
     ws.append_row(["Time", "Name", "Username", "UserID", "Action", "Content"])
 
 
-# ================= HELPERS =================
+# ================= TELEGRAM HELPERS =================
 def send_message(chat_id, text):
     r = requests.post(
         f"{TG_API}/sendMessage",
@@ -58,16 +56,11 @@ def send_message(chat_id, text):
 def edit_message(chat_id, msg_id, text):
     requests.post(
         f"{TG_API}/editMessageText",
-        data={
-            "chat_id": chat_id,
-            "message_id": msg_id,
-            "text": text,
-        }
+        data={"chat_id": chat_id, "message_id": msg_id, "text": text}
     )
 
 
-def send_message_with_keyboard(chat_id, text, keyboard):
-    """Send a message with an inline keyboard."""
+def send_keyboard(chat_id, text, keyboard):
     r = requests.post(
         f"{TG_API}/sendMessage",
         json={
@@ -123,71 +116,70 @@ def notify_owner(user):
     )
 
 
-# ================= DOWNLOAD HELPERS =================
-def yt_format_string(quality: str) -> str:
-    """
-    Returns yt-dlp format string based on quality choice.
-    quality: '360p', '720p', '1080p', 'audio'
-    """
-    if quality == "audio":
-        return "bestaudio/best"
-    height_map = {"360p": 360, "720p": 720, "1080p": 1080}
-    h = height_map.get(quality, 720)
-    # Prefer mp4, fallback to best under height, merge audio
-    return f"bv*[height<={h}][ext=mp4]+ba[ext=m4a]/bv*[height<={h}]+ba/best[height<={h}]/best"
+# ================= DOWNLOAD =================
+def cleanup(chat_id, platform):
+    base = f"dl_{platform}_{chat_id}"
+    for f in os.listdir("."):
+        if f.startswith(base):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
 
 
 def download_and_send(chat_id, user, url, quality, platform):
-    """Download via yt-dlp and send to user. quality: '360p'/'720p'/'1080p'/'audio'"""
     is_audio = quality == "audio"
-    ext = "mp3" if is_audio else "mp4"
-    out_template = f"dl_{platform}_{chat_id}.%(ext)s"
-    out_final = f"dl_{platform}_{chat_id}.{ext}"
+    base_name = f"dl_{platform}_{chat_id}"
+    out_template = f"{base_name}.%(ext)s"
 
     msg_id = send_message(chat_id, f"⬇️ Downloading ({quality})...")
 
     try:
-        cmd = [
-            "yt-dlp",
-            "-f", yt_format_string(quality),
-            "--no-playlist",
-            "-o", out_template,
-        ]
-
         if is_audio:
-            cmd += [
-                "--extract-audio",
+            cmd = [
+                "yt-dlp",
+                "--no-playlist",
+                "-x",
                 "--audio-format", "mp3",
                 "--audio-quality", "0",
+                "-o", out_template,
+                url,
             ]
         else:
-            # Force merge into mp4 container, avoid GIF/webm issues
-            cmd += [
+            height = {"360p": 360, "720p": 720, "1080p": 1080}.get(quality, 720)
+            # Simple reliable format — no complex ext filters
+            fmt = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best"
+            cmd = [
+                "yt-dlp",
+                "--no-playlist",
+                "-f", fmt,
                 "--merge-output-format", "mp4",
-                "--recode-video", "mp4",
+                "-o", out_template,
+                url,
             ]
 
-        cmd.append(url)
-        subprocess.run(cmd, check=True, timeout=600)
+        print(f"[CMD] {' '.join(cmd)}")
+        result = subprocess.run(cmd, check=True, timeout=600,
+                                capture_output=True, text=True)
+        print(result.stdout[-500:] if result.stdout else "")
 
-        # yt-dlp might name it differently — find the file
-        actual_file = out_final
-        if not os.path.exists(actual_file):
-            # Search for any file matching the template base
-            base = f"dl_{platform}_{chat_id}"
-            candidates = [f for f in os.listdir(".") if f.startswith(base)]
-            if candidates:
-                actual_file = candidates[0]
-            else:
-                raise FileNotFoundError("Downloaded file not found")
+        # Find downloaded file
+        candidates = sorted(
+            [f for f in os.listdir(".") if f.startswith(base_name)],
+            key=lambda f: os.path.getmtime(f),
+            reverse=True,
+        )
+        if not candidates:
+            raise FileNotFoundError("Downloaded file not found after yt-dlp")
 
+        actual_file = candidates[0]
         size = os.path.getsize(actual_file)
 
         if size > MAX_UPLOAD_SIZE:
             edit_message(
                 chat_id, msg_id,
-                f"⚠️ File too large ({round(size/1024/1024, 1)} MB)\n"
-                "Cannot upload files over 1 GB."
+                f"⚠️ File too large ({round(size / 1024 / 1024, 1)} MB)\n"
+                "Cannot send files over 1 GB."
             )
         else:
             edit_message(chat_id, msg_id, "📤 Uploading...")
@@ -195,45 +187,38 @@ def download_and_send(chat_id, user, url, quality, platform):
             edit_message(chat_id, msg_id, "✅ Done!")
 
         log(user, f"{platform.upper()}_{quality.upper()}", url)
-        os.remove(actual_file)
+
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "")[-300:]
+        edit_message(chat_id, msg_id, f"❌ Download failed\n{stderr}")
+        print(f"[yt-dlp ERROR] {stderr}")
 
     except subprocess.TimeoutExpired:
-        edit_message(chat_id, msg_id, "❌ Download timed out (10 min limit)")
+        edit_message(chat_id, msg_id, "❌ Timed out (10 min limit)")
+
     except Exception as e:
-        edit_message(chat_id, msg_id, f"❌ Download failed\n{str(e)[:200]}")
-        print(f"[ERROR] {platform} download: {e}")
-        # Cleanup any partial files
-        base = f"dl_{platform}_{chat_id}"
-        for f in os.listdir("."):
-            if f.startswith(base):
-                try:
-                    os.remove(f)
-                except Exception:
-                    pass
+        edit_message(chat_id, msg_id, f"❌ Error: {str(e)[:200]}")
+        print(f"[ERROR] {e}")
+
+    finally:
+        cleanup(chat_id, platform)
 
 
 def ask_quality(chat_id, url, platform):
-    """Show quality selection keyboard and store pending URL."""
+    label = "🎬 YouTube" if platform == "yt" else "📸 Instagram"
     keyboard = [
-        [
-            {"text": "🎵 Audio only (MP3)", "callback_data": f"dl|{platform}|audio"},
-        ],
+        [{"text": "🎵 Audio only (MP3)", "callback_data": f"dl|{platform}|audio"}],
         [
             {"text": "📹 360p",  "callback_data": f"dl|{platform}|360p"},
             {"text": "📹 720p",  "callback_data": f"dl|{platform}|720p"},
             {"text": "📹 1080p", "callback_data": f"dl|{platform}|1080p"},
         ],
     ]
-    msg_id = send_message_with_keyboard(
-        chat_id,
-        f"{'🎬 YouTube' if platform == 'yt' else '📸 Instagram'} link detected.\n"
-        "Choose quality / format:",
-        keyboard,
-    )
-    pending_quality[chat_id] = {"url": url, "platform": platform, "kbd_msg_id": msg_id}
+    send_keyboard(chat_id, f"{label} link detected.\nChoose quality:", keyboard)
+    pending_quality[chat_id] = {"url": url, "platform": platform}
 
 
-# ================= BOT LOOP =================
+# ================= MAIN LOOP =================
 print("🤖 Bot started")
 
 while True:
@@ -255,42 +240,38 @@ while True:
     for upd in updates["result"]:
         last_update_id = upd["update_id"]
 
-        # ===== CALLBACK QUERY (inline button press) =====
+        # ===== CALLBACK (button press) =====
         if "callback_query" in upd:
-            cb = upd["callback_query"]
-            cb_id = cb["id"]
-            cb_chat_id = cb["message"]["chat"]["id"]
-            cb_msg_id = cb["message"]["message_id"]
+            cb      = upd["callback_query"]
+            cb_chat = cb["message"]["chat"]["id"]
+            cb_msg  = cb["message"]["message_id"]
             cb_user = cb["from"]
-            data = cb.get("data", "")
+            data    = cb.get("data", "")
 
-            answer_callback(cb_id)
+            answer_callback(cb["id"])
 
             if data.startswith("dl|"):
-                _, platform, quality = data.split("|", 2)
-                pending = pending_quality.pop(cb_chat_id, None)
+                parts = data.split("|")
+                if len(parts) == 3:
+                    _, platform, quality = parts
+                    pending = pending_quality.pop(cb_chat, None)
 
-                if pending is None:
-                    send_message(cb_chat_id, "❌ Session expired. Please send the link again.")
-                    continue
-
-                # Remove the quality keyboard message
-                delete_message(cb_chat_id, cb_msg_id)
-
-                download_and_send(cb_chat_id, cb_user, pending["url"], quality, platform)
-
+                    if pending is None:
+                        send_message(cb_chat, "❌ Session expired. Please send the link again.")
+                    else:
+                        delete_message(cb_chat, cb_msg)
+                        download_and_send(cb_chat, cb_user, pending["url"], quality, platform)
             continue
 
         # ===== NORMAL MESSAGE =====
         if "message" not in upd:
             continue
 
-        msg = upd["message"]
+        msg     = upd["message"]
         chat_id = msg["chat"]["id"]
-        user = msg["from"]
-        text = msg.get("text", "")
+        user    = msg["from"]
+        text    = msg.get("text", "")
 
-        # ===== START =====
         if text == "/start":
             notify_owner(user)
             log(user, "START", "")
@@ -298,40 +279,32 @@ while True:
                 chat_id,
                 "👋 Hi!\n\n"
                 "What I can do:\n"
-                "• 🎬 YouTube link → choose quality (360p / 720p / 1080p) or audio-only MP3\n"
-                "• 📸 Instagram link → download video/photo\n"
+                "• 🎬 YouTube link → 360p / 720p / 1080p / Audio MP3\n"
+                "• 📸 Instagram link → video/photo download\n"
                 "• 📁 Forward any file → get direct download link\n\n"
-                "⬆️ Supports uploads up to 1 GB"
+                "⬆️ Max upload size: 1 GB"
             )
             continue
 
-        # ===== FILE (forward) =====
         if "document" in msg or "video" in msg:
             file_obj = msg.get("document") or msg.get("video")
-            file_id = file_obj["file_id"]
-
             r = requests.get(
                 f"{TG_API}/getFile",
-                params={"file_id": file_id}
+                params={"file_id": file_obj["file_id"]}
             ).json()
-
             if not r.get("ok"):
                 send_message(chat_id, "❌ Unable to get file info")
                 continue
-
-            path = r["result"]["file_path"]
-            link = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}"
+            link = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{r['result']['file_path']}"
             send_message(chat_id, f"⬇️ Direct download link:\n{link}")
             log(user, "FILE", link)
             continue
 
-        # ===== YOUTUBE =====
         if "youtube.com" in text or "youtu.be" in text:
             log(user, "YOUTUBE_LINK", text)
             ask_quality(chat_id, text.strip(), "yt")
             continue
 
-        # ===== INSTAGRAM =====
         if "instagram.com" in text:
             log(user, "INSTAGRAM_LINK", text)
             ask_quality(chat_id, text.strip(), "ig")
