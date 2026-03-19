@@ -108,16 +108,21 @@ def download_and_send(chat_id, user, url, quality, platform):
         # ===== VIDEO =====
         else:
             if platform == "ig":
-                fmt = "bestvideo+bestaudio/best"   # 🔥 IG fix (no GIF)
+                # ✅ FIX: bestvideo+bestaudio merge பண்ணி mp4 ஆக remux பண்றோம்
+                # இதனால் m4a பதிலா .mp4 வரும்
+                fmt = "bestvideo+bestaudio/best"
             else:
+                # ✅ FIX: bestvideo+bestaudio use பண்றோம் - இதனால் 1080p சரியா வரும்
+                # முன்னாடி best[height<=1080] என்பது pre-merged stream மட்டும் எடுக்கும் (480p)
                 height = {"360p": 360, "720p": 720, "1080p": 1080}.get(quality, 720)
-                fmt = f"best[height<={height}]"
+                fmt = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
 
             cmd = [
                 "yt-dlp",
                 "--no-playlist",
                 "-f", fmt,
                 "--merge-output-format", "mp4",
+                "--remux-video", "mp4",   # ✅ FIX: எந்த format வந்தாலும் mp4 ஆக convert ஆகும்
                 "-o", out,
                 url
             ]
