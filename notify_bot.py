@@ -1,34 +1,28 @@
+from dotenv import load_dotenv
+import os
 import requests
 import time
-import os
 import subprocess
 from datetime import datetime
 
-from dotenv import load_dotenv
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 # ================= LOAD ENV =================
-load_dotenv()  # MUST FIRST
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = os.getenv("OWNER_ID")
+OWNER_ID = int(os.getenv("OWNER_ID")) if os.getenv("OWNER_ID") else None
 SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_CREDS_FILE = os.getenv("GOOGLE_CREDS_FILE")
-
-print("ENV FILE:", GOOGLE_CREDS_FILE)
-
-# Convert OWNER_ID safely
-if OWNER_ID:
-    OWNER_ID = int(OWNER_ID)
 
 if not all([BOT_TOKEN, OWNER_ID, SHEET_ID, GOOGLE_CREDS_FILE]):
     raise RuntimeError("❌ Missing environment variables")
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 last_update_id = 0
-
-MAX_UPLOAD_SIZE = 1024 * 1024 * 1024  # 1GB
+MAX_UPLOAD_SIZE = 1024 * 1024 * 1024
 pending_quality = {}
 
 # ================= GOOGLE SHEETS =================
@@ -47,39 +41,13 @@ sheet = gc.open_by_key(SHEET_ID)
 
 try:
     ws = sheet.worksheet("telegram")
-except Exception:
+except:
     ws = sheet.add_worksheet("telegram", 1000, 10)
     ws.append_row(["Time", "Name", "Username", "UserID", "Action", "Content"])
 
-# ================= TELEGRAM HELPERS =================
+# ================= TELEGRAM =================
 def send_message(chat_id, text):
-    r = requests.post(f"{TG_API}/sendMessage", data={"chat_id": chat_id, "text": text}).json()
-    return r.get("result", {}).get("message_id")
-
-
-def edit_message(chat_id, msg_id, text):
-    requests.post(f"{TG_API}/editMessageText", data={
-        "chat_id": chat_id,
-        "message_id": msg_id,
-        "text": text
-    })
-
-
-def send_keyboard(chat_id, text, keyboard):
-    r = requests.post(f"{TG_API}/sendMessage", json={
-        "chat_id": chat_id,
-        "text": text,
-        "reply_markup": {"inline_keyboard": keyboard},
-    }).json()
-    return r.get("result", {}).get("message_id")
-
-
-def answer_callback(callback_query_id):
-    requests.post(f"{TG_API}/answerCallbackQuery", data={"callback_query_id": callback_query_id})
-
-
-def delete_message(chat_id, msg_id):
-    requests.post(f"{TG_API}/deleteMessage", data={"chat_id": chat_id, "message_id": msg_id})
+    requests.post(f"{TG_API}/sendMessage", data={"chat_id": chat_id, "text": text})
 
 
 def send_document(chat_id, file_path):
@@ -87,6 +55,19 @@ def send_document(chat_id, file_path):
         requests.post(f"{TG_API}/sendDocument",
                       data={"chat_id": chat_id},
                       files={"document": f})
+
+
+def send_keyboard(chat_id, text, keyboard):
+    requests.post(f"{TG_API}/sendMessage", json={
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": {"inline_keyboard": keyboard},
+    })
+
+
+def answer_callback(callback_query_id):
+    requests.post(f"{TG_API}/answerCallbackQuery",
+                  data={"callback_query_id": callback_query_id})
 
 
 def log(user, action, content):
@@ -99,21 +80,10 @@ def log(user, action, content):
         content,
     ])
 
-
-def notify_owner(user):
-    send_message(
-        OWNER_ID,
-        f"👤 New user\n\n"
-        f"Name: {user.get('first_name')}\n"
-        f"Username: @{user.get('username', 'N/A')}\n"
-        f"User ID: {user['id']}"
-    )
-
 # ================= DOWNLOAD =================
-def cleanup(chat_id, platform):
-    base = f"dl_{platform}_{chat_id}"
+def cleanup(prefix):
     for f in os.listdir("."):
-        if f.startswith(base):
+        if f.startswith(prefix):
             try:
                 os.remove(f)
             except:
@@ -121,54 +91,63 @@ def cleanup(chat_id, platform):
 
 
 def download_and_send(chat_id, user, url, quality, platform):
-    is_audio = quality == "audio"
-    base_name = f"dl_{platform}_{chat_id}"
-    out_template = f"{base_name}.%(ext)s"
+    base = f"dl_{platform}_{chat_id}"
+    out = f"{base}.%(ext)s"
 
-    msg_id = send_message(chat_id, f"⬇️ Downloading ({quality})...")
+    send_message(chat_id, "⬇️ Downloading...")
 
     try:
-        if is_audio:
+        # ===== AUDIO =====
+        if quality == "audio":
             cmd = [
                 "yt-dlp", "--no-playlist",
                 "-x", "--audio-format", "mp3",
-                "-o", out_template, url
+                "-o", out, url
             ]
+
+        # ===== VIDEO =====
         else:
-            height = {"360p": 360, "720p": 720, "1080p": 1080}.get(quality, 720)
-            fmt = f"bestvideo[height<={height}]+bestaudio/best"
+            if platform == "ig":
+                fmt = "bestvideo+bestaudio/best"   # 🔥 IG fix (no GIF)
+            else:
+                height = {"360p": 360, "720p": 720, "1080p": 1080}.get(quality, 720)
+                fmt = f"best[height<={height}]"
+
             cmd = [
-                "yt-dlp", "--no-playlist",
+                "yt-dlp",
+                "--no-playlist",
                 "-f", fmt,
                 "--merge-output-format", "mp4",
-                "-o", out_template, url
+                "-o", out,
+                url
             ]
 
         subprocess.run(cmd, check=True, timeout=600)
 
-        files = [f for f in os.listdir(".") if f.startswith(base_name)]
+        files = [f for f in os.listdir(".") if f.startswith(base)]
         if not files:
             raise Exception("File not found")
 
-        file_path = files[0]
+        file_path = sorted(files, key=lambda x: os.path.getmtime(x), reverse=True)[0]
         size = os.path.getsize(file_path)
 
         if size > MAX_UPLOAD_SIZE:
-            edit_message(chat_id, msg_id, "❌ File too large")
+            send_message(chat_id, "❌ File too large")
         else:
-            edit_message(chat_id, msg_id, "📤 Uploading...")
+            send_message(chat_id, "📤 Uploading...")
             send_document(chat_id, file_path)
-            edit_message(chat_id, msg_id, "✅ Done!")
+            send_message(chat_id, "✅ Done!")
 
         log(user, f"{platform}_{quality}", url)
 
     except Exception as e:
-        edit_message(chat_id, msg_id, f"❌ Error: {str(e)}")
+        send_message(chat_id, f"❌ Error: {str(e)}")
 
     finally:
-        cleanup(chat_id, platform)
+        cleanup(base)
 
 
+# ================= QUALITY =================
 def ask_quality(chat_id, url, platform):
     keyboard = [
         [{"text": "🎵 Audio", "callback_data": f"dl|{platform}|audio"}],
@@ -181,7 +160,8 @@ def ask_quality(chat_id, url, platform):
     send_keyboard(chat_id, "Choose quality:", keyboard)
     pending_quality[chat_id] = {"url": url, "platform": platform}
 
-# ================= MAIN LOOP =================
+
+# ================= MAIN =================
 print("🤖 Bot started")
 
 while True:
@@ -191,14 +171,14 @@ while True:
             params={"offset": last_update_id + 1, "timeout": 30},
             timeout=35,
         ).json()
-    except Exception as e:
-        print("Poll error:", e)
+    except:
         time.sleep(2)
         continue
 
     for upd in updates.get("result", []):
         last_update_id = upd["update_id"]
 
+        # ===== CALLBACK =====
         if "callback_query" in upd:
             cb = upd["callback_query"]
             chat_id = cb["message"]["chat"]["id"]
@@ -216,23 +196,28 @@ while True:
                     send_message(chat_id, "❌ Session expired")
             continue
 
+        # ===== MESSAGE =====
         if "message" not in upd:
             continue
 
         msg = upd["message"]
         chat_id = msg["chat"]["id"]
+        user = msg["from"]
         text = msg.get("text", "")
 
         if text == "/start":
-            notify_owner(msg["from"])
-            send_message(chat_id, "Send YouTube / Instagram link")
+            send_message(chat_id, "👋 Send YouTube or Instagram link")
             continue
 
+        # ===== YOUTUBE =====
         if "youtube.com" in text or "youtu.be" in text:
             ask_quality(chat_id, text, "yt")
+
+        # ===== INSTAGRAM (AUTO) =====
         elif "instagram.com" in text:
-            ask_quality(chat_id, text, "ig")
+            download_and_send(chat_id, user, text, "720p", "ig")
+
         else:
-            send_message(chat_id, "❌ Invalid input")
+            send_message(chat_id, "❌ Send valid link")
 
     time.sleep(1)
