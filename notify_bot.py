@@ -1,28 +1,34 @@
 import requests
 import time
 import os
-import json
 import subprocess
 from datetime import datetime
 
+from dotenv import load_dotenv
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# ================= ENV =================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID"))
-SHEET_ID = os.getenv("SHEET_ID")
-GOOGLE_CREDS_RAW = os.getenv("GOOGLE_CREDENTIALS")
+# ================= LOAD ENV =================
+load_dotenv()  # MUST FIRST
 
-if not all([BOT_TOKEN, OWNER_ID, SHEET_ID, GOOGLE_CREDS_RAW]):
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = os.getenv("OWNER_ID")
+SHEET_ID = os.getenv("SHEET_ID")
+GOOGLE_CREDS_FILE = os.getenv("GOOGLE_CREDS_FILE")
+
+print("ENV FILE:", GOOGLE_CREDS_FILE)
+
+# Convert OWNER_ID safely
+if OWNER_ID:
+    OWNER_ID = int(OWNER_ID)
+
+if not all([BOT_TOKEN, OWNER_ID, SHEET_ID, GOOGLE_CREDS_FILE]):
     raise RuntimeError("❌ Missing environment variables")
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 last_update_id = 0
 
 MAX_UPLOAD_SIZE = 1024 * 1024 * 1024  # 1GB
-
-# Stores pending quality selections: { chat_id: { "url": ..., "platform": ... } }
 pending_quality = {}
 
 # ================= GOOGLE SHEETS =================
@@ -31,9 +37,11 @@ scope = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
-creds = ServiceAccountCredentials.from_json_keyfile_dict(
-    json.loads(GOOGLE_CREDS_RAW), scope
+
+creds = ServiceAccountCredentials.from_json_keyfile_name(
+    GOOGLE_CREDS_FILE, scope
 )
+
 gc = gspread.authorize(creds)
 sheet = gc.open_by_key(SHEET_ID)
 
@@ -43,56 +51,42 @@ except Exception:
     ws = sheet.add_worksheet("telegram", 1000, 10)
     ws.append_row(["Time", "Name", "Username", "UserID", "Action", "Content"])
 
-
 # ================= TELEGRAM HELPERS =================
 def send_message(chat_id, text):
-    r = requests.post(
-        f"{TG_API}/sendMessage",
-        data={"chat_id": chat_id, "text": text}
-    ).json()
-    return r["result"]["message_id"] if r.get("ok") else None
+    r = requests.post(f"{TG_API}/sendMessage", data={"chat_id": chat_id, "text": text}).json()
+    return r.get("result", {}).get("message_id")
 
 
 def edit_message(chat_id, msg_id, text):
-    requests.post(
-        f"{TG_API}/editMessageText",
-        data={"chat_id": chat_id, "message_id": msg_id, "text": text}
-    )
+    requests.post(f"{TG_API}/editMessageText", data={
+        "chat_id": chat_id,
+        "message_id": msg_id,
+        "text": text
+    })
 
 
 def send_keyboard(chat_id, text, keyboard):
-    r = requests.post(
-        f"{TG_API}/sendMessage",
-        json={
-            "chat_id": chat_id,
-            "text": text,
-            "reply_markup": {"inline_keyboard": keyboard},
-        }
-    ).json()
-    return r["result"]["message_id"] if r.get("ok") else None
+    r = requests.post(f"{TG_API}/sendMessage", json={
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": {"inline_keyboard": keyboard},
+    }).json()
+    return r.get("result", {}).get("message_id")
 
 
 def answer_callback(callback_query_id):
-    requests.post(
-        f"{TG_API}/answerCallbackQuery",
-        data={"callback_query_id": callback_query_id}
-    )
+    requests.post(f"{TG_API}/answerCallbackQuery", data={"callback_query_id": callback_query_id})
 
 
 def delete_message(chat_id, msg_id):
-    requests.post(
-        f"{TG_API}/deleteMessage",
-        data={"chat_id": chat_id, "message_id": msg_id}
-    )
+    requests.post(f"{TG_API}/deleteMessage", data={"chat_id": chat_id, "message_id": msg_id})
 
 
 def send_document(chat_id, file_path):
     with open(file_path, "rb") as f:
-        requests.post(
-            f"{TG_API}/sendDocument",
-            data={"chat_id": chat_id},
-            files={"document": f}
-        )
+        requests.post(f"{TG_API}/sendDocument",
+                      data={"chat_id": chat_id},
+                      files={"document": f})
 
 
 def log(user, action, content):
@@ -115,7 +109,6 @@ def notify_owner(user):
         f"User ID: {user['id']}"
     )
 
-
 # ================= DOWNLOAD =================
 def cleanup(chat_id, platform):
     base = f"dl_{platform}_{chat_id}"
@@ -123,7 +116,7 @@ def cleanup(chat_id, platform):
         if f.startswith(base):
             try:
                 os.remove(f)
-            except Exception:
+            except:
                 pass
 
 
@@ -137,86 +130,56 @@ def download_and_send(chat_id, user, url, quality, platform):
     try:
         if is_audio:
             cmd = [
-                "yt-dlp",
-                "--no-playlist",
-                "-x",
-                "--audio-format", "mp3",
-                "--audio-quality", "0",
-                "-o", out_template,
-                url,
+                "yt-dlp", "--no-playlist",
+                "-x", "--audio-format", "mp3",
+                "-o", out_template, url
             ]
         else:
             height = {"360p": 360, "720p": 720, "1080p": 1080}.get(quality, 720)
-            # Simple reliable format — no complex ext filters
-            fmt = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best"
+            fmt = f"bestvideo[height<={height}]+bestaudio/best"
             cmd = [
-                "yt-dlp",
-                "--no-playlist",
+                "yt-dlp", "--no-playlist",
                 "-f", fmt,
                 "--merge-output-format", "mp4",
-                "-o", out_template,
-                url,
+                "-o", out_template, url
             ]
 
-        print(f"[CMD] {' '.join(cmd)}")
-        result = subprocess.run(cmd, check=True, timeout=600,
-                                capture_output=True, text=True)
-        print(result.stdout[-500:] if result.stdout else "")
+        subprocess.run(cmd, check=True, timeout=600)
 
-        # Find downloaded file
-        candidates = sorted(
-            [f for f in os.listdir(".") if f.startswith(base_name)],
-            key=lambda f: os.path.getmtime(f),
-            reverse=True,
-        )
-        if not candidates:
-            raise FileNotFoundError("Downloaded file not found after yt-dlp")
+        files = [f for f in os.listdir(".") if f.startswith(base_name)]
+        if not files:
+            raise Exception("File not found")
 
-        actual_file = candidates[0]
-        size = os.path.getsize(actual_file)
+        file_path = files[0]
+        size = os.path.getsize(file_path)
 
         if size > MAX_UPLOAD_SIZE:
-            edit_message(
-                chat_id, msg_id,
-                f"⚠️ File too large ({round(size / 1024 / 1024, 1)} MB)\n"
-                "Cannot send files over 1 GB."
-            )
+            edit_message(chat_id, msg_id, "❌ File too large")
         else:
             edit_message(chat_id, msg_id, "📤 Uploading...")
-            send_document(chat_id, actual_file)
+            send_document(chat_id, file_path)
             edit_message(chat_id, msg_id, "✅ Done!")
 
-        log(user, f"{platform.upper()}_{quality.upper()}", url)
-
-    except subprocess.CalledProcessError as e:
-        stderr = (e.stderr or "")[-300:]
-        edit_message(chat_id, msg_id, f"❌ Download failed\n{stderr}")
-        print(f"[yt-dlp ERROR] {stderr}")
-
-    except subprocess.TimeoutExpired:
-        edit_message(chat_id, msg_id, "❌ Timed out (10 min limit)")
+        log(user, f"{platform}_{quality}", url)
 
     except Exception as e:
-        edit_message(chat_id, msg_id, f"❌ Error: {str(e)[:200]}")
-        print(f"[ERROR] {e}")
+        edit_message(chat_id, msg_id, f"❌ Error: {str(e)}")
 
     finally:
         cleanup(chat_id, platform)
 
 
 def ask_quality(chat_id, url, platform):
-    label = "🎬 YouTube" if platform == "yt" else "📸 Instagram"
     keyboard = [
-        [{"text": "🎵 Audio only (MP3)", "callback_data": f"dl|{platform}|audio"}],
+        [{"text": "🎵 Audio", "callback_data": f"dl|{platform}|audio"}],
         [
-            {"text": "📹 360p",  "callback_data": f"dl|{platform}|360p"},
-            {"text": "📹 720p",  "callback_data": f"dl|{platform}|720p"},
-            {"text": "📹 1080p", "callback_data": f"dl|{platform}|1080p"},
+            {"text": "360p", "callback_data": f"dl|{platform}|360p"},
+            {"text": "720p", "callback_data": f"dl|{platform}|720p"},
+            {"text": "1080p", "callback_data": f"dl|{platform}|1080p"},
         ],
     ]
-    send_keyboard(chat_id, f"{label} link detected.\nChoose quality:", keyboard)
+    send_keyboard(chat_id, "Choose quality:", keyboard)
     pending_quality[chat_id] = {"url": url, "platform": platform}
-
 
 # ================= MAIN LOOP =================
 print("🤖 Bot started")
@@ -229,87 +192,47 @@ while True:
             timeout=35,
         ).json()
     except Exception as e:
-        print(f"[POLL ERROR] {e}")
+        print("Poll error:", e)
         time.sleep(2)
         continue
 
-    if not updates.get("ok"):
-        time.sleep(2)
-        continue
-
-    for upd in updates["result"]:
+    for upd in updates.get("result", []):
         last_update_id = upd["update_id"]
 
-        # ===== CALLBACK (button press) =====
         if "callback_query" in upd:
-            cb      = upd["callback_query"]
-            cb_chat = cb["message"]["chat"]["id"]
-            cb_msg  = cb["message"]["message_id"]
-            cb_user = cb["from"]
-            data    = cb.get("data", "")
+            cb = upd["callback_query"]
+            chat_id = cb["message"]["chat"]["id"]
+            data = cb.get("data", "")
 
             answer_callback(cb["id"])
 
             if data.startswith("dl|"):
-                parts = data.split("|")
-                if len(parts) == 3:
-                    _, platform, quality = parts
-                    pending = pending_quality.pop(cb_chat, None)
+                _, platform, quality = data.split("|")
+                pending = pending_quality.pop(chat_id, None)
 
-                    if pending is None:
-                        send_message(cb_chat, "❌ Session expired. Please send the link again.")
-                    else:
-                        delete_message(cb_chat, cb_msg)
-                        download_and_send(cb_chat, cb_user, pending["url"], quality, platform)
+                if pending:
+                    download_and_send(chat_id, cb["from"], pending["url"], quality, platform)
+                else:
+                    send_message(chat_id, "❌ Session expired")
             continue
 
-        # ===== NORMAL MESSAGE =====
         if "message" not in upd:
             continue
 
-        msg     = upd["message"]
+        msg = upd["message"]
         chat_id = msg["chat"]["id"]
-        user    = msg["from"]
-        text    = msg.get("text", "")
+        text = msg.get("text", "")
 
         if text == "/start":
-            notify_owner(user)
-            log(user, "START", "")
-            send_message(
-                chat_id,
-                "👋 Hi!\n\n"
-                "What I can do:\n"
-                "• 🎬 YouTube link → 360p / 720p / 1080p / Audio MP3\n"
-                "• 📸 Instagram link → video/photo download\n"
-                "• 📁 Forward any file → get direct download link\n\n"
-                "⬆️ Max upload size: 1 GB"
-            )
-            continue
-
-        if "document" in msg or "video" in msg:
-            file_obj = msg.get("document") or msg.get("video")
-            r = requests.get(
-                f"{TG_API}/getFile",
-                params={"file_id": file_obj["file_id"]}
-            ).json()
-            if not r.get("ok"):
-                send_message(chat_id, "❌ Unable to get file info")
-                continue
-            link = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{r['result']['file_path']}"
-            send_message(chat_id, f"⬇️ Direct download link:\n{link}")
-            log(user, "FILE", link)
+            notify_owner(msg["from"])
+            send_message(chat_id, "Send YouTube / Instagram link")
             continue
 
         if "youtube.com" in text or "youtu.be" in text:
-            log(user, "YOUTUBE_LINK", text)
-            ask_quality(chat_id, text.strip(), "yt")
-            continue
-
-        if "instagram.com" in text:
-            log(user, "INSTAGRAM_LINK", text)
-            ask_quality(chat_id, text.strip(), "ig")
-            continue
-
-        send_message(chat_id, "❌ Send a YouTube / Instagram link or forward a file.")
+            ask_quality(chat_id, text, "yt")
+        elif "instagram.com" in text:
+            ask_quality(chat_id, text, "ig")
+        else:
+            send_message(chat_id, "❌ Invalid input")
 
     time.sleep(1)
